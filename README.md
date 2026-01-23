@@ -5,7 +5,6 @@ Code for the paper "MixTracker: An Effective Graph-Based Framework for Address L
 ## Status
 
 *   ✅ The complete codebase has been released, including the full pipeline for data preparation, model training, and evaluation.
-*   Intermediate files, such as the constructed graph data, will be uploaded after the paper is accepted.
 
 ## Configuration
 
