@@ -1,9 +1,11 @@
 torch
 requests
-bs4
+beautifulsoup4
 pandas
 tqdm
 numpy
 scikit-learn
 torch-geometric
 urllib3
+networkx
+node2vec

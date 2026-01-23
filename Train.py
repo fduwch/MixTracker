@@ -1,46 +1,37 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import Adam, AdamW
+from torch.optim import AdamW
 from torch_geometric.data import Batch
 import random
 import json
 import numpy as np
 import pandas as pd
 import argparse
-from sklearn.model_selection import train_test_split, KFold
+from sklearn.model_selection import KFold
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
-from Model import PairwiseRankingGNN # Updated import
+from Model import PairwiseRankingGNN
 from Graph import build_address_graph
 import os
 import csv
 from datetime import datetime
 
-# Generate timestamp once at program start
 RUN_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-# --- Configuration ---
 SEED = 1029
-NUM_RUNS = 4
+NUM_RUNS = 3
 NODE_FEATURE_DIM = 19
-EDGE_FEATURE_DIM = 5 # value, gasUsed, gasPrice, timeStamp, tx_type
+EDGE_FEATURE_DIM = 5
 GROUND_TRUTH_FILES = [
-    'Dataset/GroundTruth/heist_0x12d66f87a04a9e220743712ce6d9bb1b5616b8fc.json',
-    'Dataset/GroundTruth/heist_0x47ce0c6ed5b0ce3d3a51fdb1c52dc66a7c3c2936.json',
-    'Dataset/GroundTruth/heist_0x910cbd523d972eb0a6f4cae4618ad62622b39dbf.json',
-    'Dataset/GroundTruth/heist_0xa160cdab225685da1d56aa342ad8841c3b53f291.json'
+    'Dataset/AMLValidation/train_all_all.json'
 ]
 LEARNING_RATE = 0.001
 EPOCHS = 1000
-BATCH_SIZE = 32 # BPR Loss uses triplets, so effective batch size is smaller
-MODEL_SAVE_PATH = 'best_ranking_model.pth' # New model name
-# DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # Will be set based on args
-EARLY_STOPPING_PATIENCE = 50
-MAX_TIME_DIFF_SECONDS = 90 * 24 * 60 * 60 # 90 days in seconds
+BATCH_SIZE = 32
+MODEL_SAVE_PATH = 'best_ranking_model.pth'
+EARLY_STOPPING_PATIENCE = 60
+MAX_TIME_DIFF_SECONDS = 90 * 24 * 60 * 60
 GRAPH_CACHE_DIR = 'graph_cache'
-EVAL_BATCH_SIZE = 64 # Keep this manageable for evaluation
+EVAL_BATCH_SIZE = 64
 K_FOLD = 10
-POS_WEIGHT = 0.5 # Add weight to BCE loss to balance precision/recall
+POS_WEIGHT = 0.5
 
 def set_seed(seed):
     """Set random seeds for reproducibility."""
@@ -53,24 +44,12 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# --- Loss Function ---
-# We are changing from BPR Loss to Binary Cross-Entropy for link prediction
-loss_func = torch.nn.BCEWithLogitsLoss()
-
-# --- Data Loading for Training ---
 def create_pair_features(deposit_pair, candidate_pair):
-    """Calculates pairwise features between a deposit and a candidate."""
     time_diff = abs(candidate_pair['withdraw_timeStamp'] - deposit_pair['deposit_timeStamp'])
-    # Apply log transform to scale the feature and prevent numerical instability
     scaled_time_diff = np.log1p(time_diff)
-    # More features can be added here, e.g., token type differences
     return [scaled_time_diff]
 
 def load_and_prep_data_for_ranking(json_files):
-    """
-    Loads data from JSON files and prepares it for binary classification link prediction,
-    matching the output format of load_mixbroker_data.
-    """
     print("Loading and preparing ground truth data for link prediction...")
     all_positive_pairs = []
 
@@ -80,7 +59,6 @@ def load_and_prep_data_for_ranking(json_files):
                 pairs = json.load(f)
             if not pairs: continue
             
-            # Filter pairs based on time difference
             pairs = [p for p in pairs if (p['withdraw_timeStamp'] - p['deposit_timeStamp']) <= MAX_TIME_DIFF_SECONDS]
             all_positive_pairs.extend(pairs)
         except Exception as e:
@@ -89,19 +67,14 @@ def load_and_prep_data_for_ranking(json_files):
 
     print(f"Loaded {len(all_positive_pairs)} total positive pairs.")
 
-    # --- Negative Sampling ---
     all_pairs_with_labels = []
-    withdrawal_pool = [p for p in all_positive_pairs] # Pool of all possible withdrawals
-    time_window_seconds = 24 * 60 * 60 # 24 hours for hard negative sampling
+    withdrawal_pool = [p for p in all_positive_pairs]
+    time_window_seconds = 24 * 60 * 60
 
     for pos_pair in all_positive_pairs:
-        # Add the positive pair with label 1
         all_pairs_with_labels.append({'pair': pos_pair, 'label': 1})
         
-        # --- Hard Negative Sampling ---
         deposit_time = pos_pair['deposit_timeStamp']
-        
-        # Find candidates within a time window relative to the true deposit time
         hard_negative_candidates = [
             p for p in withdrawal_pool 
             if abs(p['withdraw_timeStamp'] - deposit_time) < time_window_seconds
@@ -110,23 +83,18 @@ def load_and_prep_data_for_ranking(json_files):
         
         neg_candidate = None
         if hard_negative_candidates:
-            # If we found hard negatives, pick one
             neg_candidate = random.choice(hard_negative_candidates)
         else:
-            # Fallback to random sampling if no candidates are found in the window
-            # Ensure the negative candidate is not the true withdrawal for the same deposit
             while neg_candidate is None or neg_candidate['withdraw_address'] == pos_pair['withdraw_address']:
                 neg_candidate = random.choice(withdrawal_pool)
         
-        # The negative pair shares the same deposit but has a different withdrawal
         neg_pair = pos_pair.copy()
         neg_pair['withdraw_address'] = neg_candidate['withdraw_address']
         neg_pair['withdraw_blockNumber'] = neg_candidate['withdraw_blockNumber']
         neg_pair['withdraw_timeStamp'] = neg_candidate['withdraw_timeStamp']
 
-        # all_pairs_with_labels.append({'pair': neg_pair, 'label': 0})
+        all_pairs_with_labels.append({'pair': neg_pair, 'label': 0})
 
-    # --- Graph Building ---
     print("Building or loading graphs from cache...")
     os.makedirs(GRAPH_CACHE_DIR, exist_ok=True)
     
@@ -138,7 +106,6 @@ def load_and_prep_data_for_ranking(json_files):
 
     address_to_graph = {}
     for i, addr in enumerate(list(unique_addrs)):
-        # For this dataset, we build the full graph for each address
         cache_path = os.path.join(GRAPH_CACHE_DIR, f"{addr}_full.pt")
         if os.path.exists(cache_path):
             address_to_graph[addr] = torch.load(cache_path)
@@ -148,7 +115,6 @@ def load_and_prep_data_for_ranking(json_files):
                 torch.save(graph, cache_path)
             address_to_graph[addr] = graph
 
-    # --- Package Data ---
     packaged_data = []
     for item in all_pairs_with_labels:
         pair = item['pair']
@@ -160,14 +126,15 @@ def load_and_prep_data_for_ranking(json_files):
         graph2 = address_to_graph.get(addr2)
 
         if graph1 and graph2:
-            # Unlike MixBroker, here we have real features
             pair_features = torch.tensor(create_pair_features(pair, pair), dtype=torch.float32)
             
             packaged_data.append({
                 'graph1': graph1,
                 'graph2': graph2,
                 'features': pair_features,
-                'label': torch.tensor([float(label)], dtype=torch.float32)
+                'label': torch.tensor([float(label)], dtype=torch.float32),
+                'addr1': addr1,
+                'addr2': addr2
             })
             
     print(f"Total packaged data pairs: {len(packaged_data)}")
@@ -175,17 +142,13 @@ def load_and_prep_data_for_ranking(json_files):
 
 
 def load_mixbroker_data(data_type='D1'):
-    """
-    Loads MixBroker data and prepares it for binary classification link prediction.
-    """
     print("Loading MixBroker dataset for link prediction...")
-    node_feature_df = pd.read_csv('Baseline/MixBroker-main/Dataset/Graph/node_feature.csv')
-    train_pos_edge_df = pd.read_csv('Baseline/MixBroker-main/Dataset/Graph/train_pos_edge_10fold.csv')
-    train_neg_edge_df = pd.read_csv('Baseline/MixBroker-main/Dataset/Graph/train_neg_edge_10fold.csv')
+    node_feature_df = pd.read_csv('Dataset/mixbroker_raw_data/Graph/node_feature.csv')
+    train_pos_edge_df = pd.read_csv('Dataset/mixbroker_raw_data/Graph/train_pos_edge_10fold.csv')
+    train_neg_edge_df = pd.read_csv('Dataset/mixbroker_raw_data/Graph/train_neg_edge_10fold.csv')
 
     nodeid_to_addr = dict(zip(node_feature_df['nodeid'], node_feature_df['node']))
 
-    # Load positive and negative pairs
     pos_pairs = [(nodeid_to_addr[r['nodeid1']], nodeid_to_addr[r['nodeid2']]) for _, r in train_pos_edge_df.iterrows()]
     neg_pairs = [(nodeid_to_addr[r['nodeid1']], nodeid_to_addr[r['nodeid2']]) for _, r in train_neg_edge_df.iterrows()]
     
@@ -196,20 +159,18 @@ def load_mixbroker_data(data_type='D1'):
         rule2_df = pd.concat([pd.read_csv(f) for f in rule2_files])
         rule3_df = pd.concat([pd.read_csv(f) for f in rule3_files])
 
-        # 去重后的添加
         extra_pairs = set((r['sender'], r['receiver']) for _, r in rule2_df.iterrows())
         extra_pairs.update((r['sender'], r['receiver']) for _, r in rule3_df.iterrows())
         pos_pairs += list(extra_pairs - set(pos_pairs))
 
     print(f"Loaded for {data_type} - Positive pairs: {len(pos_pairs)}, Negative pairs: {len(neg_pairs)}")
 
-    # Create labels (1 for positive, 0 for negative)
     all_pairs = pos_pairs + neg_pairs
     all_labels = [1] * len(pos_pairs) + [0] * len(neg_pairs)
     
     if data_type == 'D2':
         print("Sampling 75% of D1 data to create D2 dataset...")
-        set_seed(SEED) # Ensure sampling is reproducible
+        set_seed(SEED)
         
         combined_data = list(zip(all_pairs, all_labels))
         random.shuffle(combined_data)
@@ -234,9 +195,6 @@ def load_mixbroker_data(data_type='D1'):
     os.makedirs(GRAPH_CACHE_DIR, exist_ok=True)
     
     unique_addrs = set(addr for pair in all_pairs for addr in pair)
-    
-    # with open('Dataset/unique_addrs.json', 'w') as f:
-    #     f.write(json.dumps(list(unique_addrs)))
 
     address_to_graph = {}
     for i, addr in enumerate(list(unique_addrs)):
@@ -260,15 +218,16 @@ def load_mixbroker_data(data_type='D1'):
             packaged_data.append({
                 'graph1': graph1,
                 'graph2': graph2,
-                'features': torch.tensor([0.0], dtype=torch.float32), # Placeholder
-                'label': torch.tensor([float(label)], dtype=torch.float32)
+                'features': torch.tensor([0.0], dtype=torch.float32),
+                'label': torch.tensor([float(label)], dtype=torch.float32),
+                'addr1': addr1,
+                'addr2': addr2
             })
             
     print(f"Total packaged data pairs: {len(packaged_data)}")
     return packaged_data
 
 
-# --- Training Loop ---
 def train_classification_model(model, train_data, optimizer, loss_func, device):
     model.train()
     total_loss = 0
@@ -278,7 +237,6 @@ def train_classification_model(model, train_data, optimizer, loss_func, device):
     for i in range(0, len(train_data), BATCH_SIZE):
         batch = train_data[i:i+BATCH_SIZE]
         
-        # Skip batches with size <= 1, as they cause issues with BatchNorm during training
         if len(batch) <= 1:
             continue
         
@@ -302,7 +260,6 @@ def train_classification_model(model, train_data, optimizer, loss_func, device):
         return total_loss / batches_processed
     return 0.0
 
-# --- Evaluation Loop ---
 def evaluate_classification_model(model, val_data, device):
     model.eval()
     all_preds = []
@@ -321,7 +278,7 @@ def evaluate_classification_model(model, val_data, device):
             preds = (torch.sigmoid(logits) > 0.5).cpu()
             
             all_preds.append(preds)
-            all_labels.append(labels.cpu()) # Ensure labels are on CPU for concatenation
+            all_labels.append(labels.cpu())
     
     all_preds = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
@@ -331,22 +288,19 @@ def evaluate_classification_model(model, val_data, device):
     recall = recall_score(all_labels, all_preds, zero_division=0)
     f1 = f1_score(all_labels, all_preds, zero_division=0)
     
-    # Calculate FPR and FNR from confusion matrix
-    if len(np.unique(all_labels)) == 2: # Ensure we have both classes present
+    if len(np.unique(all_labels)) == 2:
         tn, fp, fn, tp = confusion_matrix(all_labels, all_preds).ravel()
         fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
         fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
-    else: # Handle case where only one class is in the validation set for a small fold
+    else:
         fpr, fnr = 0.0, 0.0
 
     return accuracy, precision, recall, f1, fpr, fnr
 
 
 def save_results_to_csv(results, params, filename='training_results.csv'):
-    """Saves training results and parameters to a CSV file."""
     file_exists = os.path.isfile(filename)
 
-    # Format metrics as "mean±std" with 4 decimal places
     formatted_results = {
         'Accuracy': f"{results['avg_accuracy']:.4f}±{results['std_accuracy']:.4f}",
         'Precision': f"{results['avg_precision']:.4f}±{results['std_precision']:.4f}",
@@ -359,7 +313,6 @@ def save_results_to_csv(results, params, filename='training_results.csv'):
 
     row_data = {**params, **formatted_results}
     
-    # Keep a consistent order for columns
     param_keys = ['Dataset', 'Use_Extra_Data', 'Learning_Rate', 'Epochs', 'Batch_Size', 'K_Fold', 'Seed', 'Patience', 'Num_Runs', 'Pos_Weight',
                   'Use_Graph', 'GNN_Type']
     result_keys = ['Best_Run', 'F1', 'Accuracy', 'Precision', 'Recall', 'FPR', 'FNR']
@@ -387,15 +340,12 @@ def run_experiment(config, all_data, extra_data, device):
     use_extra_data = config['use_extra_data']
     
 
-    best_run_avg_f1 = 0.0
-    best_run_results = {}
+    all_run_results = []
 
     for run in range(1, NUM_RUNS + 1):
         print(f"\n{'='*20} Starting Run {run}/{NUM_RUNS} {'='*20}")
-        # Use a different seed for each run for variability
         set_seed(SEED)
         
-        # 1. Set up K-fold cross-validation
         kf = KFold(n_splits=K_FOLD, shuffle=True, random_state=SEED)
         fold_results = []
 
@@ -405,14 +355,38 @@ def run_experiment(config, all_data, extra_data, device):
             train_pairs = all_data[train_idx].tolist()
             val_pairs = all_data[val_idx].tolist()
 
-            # Add the extra data to the training set if specified
+            val_addrs = set()
+            for item in val_pairs:
+                val_addrs.add(item['addr1'])
+                val_addrs.add(item['addr2'])
+            
+            original_train_len = len(train_pairs)
+            train_pairs = [
+                item for item in train_pairs 
+                if item['addr1'] not in val_addrs and item['addr2'] not in val_addrs
+            ]
+            print(f"  - Address-Disjoint Filter: Removed {original_train_len - len(train_pairs)} pairs from training set.")
+
             if use_extra_data:
-                train_pairs.extend(extra_data)
+                extra_filtered = [
+                    item for item in extra_data
+                    if item['addr1'] not in val_addrs and item['addr2'] not in val_addrs
+                ]
+                train_pairs.extend(extra_filtered)
+                print(f"  - Added {len(extra_filtered)} extra pairs (filtered from {len(extra_data)}).")
+            
+            train_addrs = set()
+            for item in train_pairs:
+                train_addrs.add(item['addr1'])
+                train_addrs.add(item['addr2'])
+            overlapping_addrs = train_addrs & val_addrs
+            assert len(overlapping_addrs) == 0, \
+                f"ERROR: Address-disjoint split violated! {len(overlapping_addrs)} addresses overlap between train and validation sets: {list(overlapping_addrs)[:5]}"
+            print(f"  - Verification: Address-disjoint split confirmed (0 overlapping addresses).")
 
             print(f"  - Total training pairs for this fold: {len(train_pairs)}")
             print(f"  - Total validation pairs for this fold: {len(val_pairs)}")
 
-            # 2. Initialize model and optimizer for each fold
             PAIR_FEATURE_DIM = 1
             model = PairwiseRankingGNN(
                 node_feature_dim=NODE_FEATURE_DIM,
@@ -422,9 +396,6 @@ def run_experiment(config, all_data, extra_data, device):
                 gnn_type=config['gnn_type']
             ).to(device)
             optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
-
-            # Initialize weighted loss function for this fold
-            # loss_func = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([POS_WEIGHT], device=device))
             loss_func = torch.nn.BCEWithLogitsLoss()
 
             best_f1 = 0.0
@@ -434,12 +405,11 @@ def run_experiment(config, all_data, extra_data, device):
                 avg_loss = train_classification_model(model, train_pairs, optimizer, loss_func, device)
                 accuracy, precision, recall, f1, fpr, fnr = evaluate_classification_model(model, val_pairs, device)
 
-                if epoch % 10 == 0: # Print every 10 epochs to reduce verbosity
+                if epoch % 10 == 0:
                     print(f"  Epoch {epoch:03d}/{EPOCHS} | Loss: {avg_loss:.4f} | Precision: {precision:.2%} | Recall: {recall:.2%} | F1: {f1:.2%} | FPR: {fpr:.4%} | FNR: {fnr:.4%}")
 
                 if f1 > best_f1:
                     best_f1 = f1
-                    # Save best metrics for this fold
                     best_fold_metrics = (accuracy, precision, recall, f1, fpr, fnr)
                     epochs_no_improve = 0
                 else:
@@ -451,7 +421,6 @@ def run_experiment(config, all_data, extra_data, device):
             print(f"Fold {fold+1}/{K_FOLD} Best F1: {best_fold_metrics[3]:.4f} | Precision: {best_fold_metrics[1]:.2%} | Recall: {best_fold_metrics[2]:.2%} | Accuracy: {best_fold_metrics[0]:.4f} | FPR: {best_fold_metrics[4]:.2%} | FNR: {best_fold_metrics[5]:.2%}")
             fold_results.append(best_fold_metrics)
 
-        # --- This Run's Final Results ---
         print(f"\n--- Run {run}/{NUM_RUNS} Cross-Validation Summary ---")
         avg_accuracy = np.mean([res[0] for res in fold_results])
         avg_precision = np.mean([res[1] for res in fold_results])
@@ -469,22 +438,43 @@ def run_experiment(config, all_data, extra_data, device):
 
         print(f"Run {run} Average F1-score: {avg_f1:.2%} ± {std_f1:.2%}")
 
-        if avg_f1 > best_run_avg_f1:
-            best_run_avg_f1 = avg_f1
-            best_run_results = {
-                'run': run,
-                'avg_accuracy': avg_accuracy, 'std_accuracy': std_accuracy,
-                'avg_precision': avg_precision, 'std_precision': std_precision,
-                'avg_recall': avg_recall, 'std_recall': std_recall,
-                'avg_f1': avg_f1, 'std_f1': std_f1,
-                'avg_fpr': avg_fpr, 'std_fpr': std_fpr,
-                'avg_fnr': avg_fnr, 'std_fnr': std_fnr,
-            }
+        all_run_results.append({
+            'run': run,
+            'avg_accuracy': avg_accuracy, 'std_accuracy': std_accuracy,
+            'avg_precision': avg_precision, 'std_precision': std_precision,
+            'avg_recall': avg_recall, 'std_recall': std_recall,
+            'avg_f1': avg_f1, 'std_f1': std_f1,
+            'avg_fpr': avg_fpr, 'std_fpr': std_fpr,
+            'avg_fnr': avg_fnr, 'std_fnr': std_fnr,
+        })
     
-    return best_run_results
+    avg_accuracy = np.mean([r['avg_accuracy'] for r in all_run_results])
+    avg_precision = np.mean([r['avg_precision'] for r in all_run_results])
+    avg_recall = np.mean([r['avg_recall'] for r in all_run_results])
+    avg_f1 = np.mean([r['avg_f1'] for r in all_run_results])
+    avg_fpr = np.mean([r['avg_fpr'] for r in all_run_results])
+    avg_fnr = np.mean([r['avg_fnr'] for r in all_run_results])
+    
+    std_accuracy = np.std([r['avg_accuracy'] for r in all_run_results])
+    std_precision = np.std([r['avg_precision'] for r in all_run_results])
+    std_recall = np.std([r['avg_recall'] for r in all_run_results])
+    std_f1 = np.std([r['avg_f1'] for r in all_run_results])
+    std_fpr = np.std([r['avg_fpr'] for r in all_run_results])
+    std_fnr = np.std([r['avg_fnr'] for r in all_run_results])
+    
+    best_run_idx = np.argmax([r['avg_f1'] for r in all_run_results])
+    
+    return {
+        'run': all_run_results[best_run_idx]['run'],
+        'avg_accuracy': avg_accuracy, 'std_accuracy': std_accuracy,
+        'avg_precision': avg_precision, 'std_precision': std_precision,
+        'avg_recall': avg_recall, 'std_recall': std_recall,
+        'avg_f1': avg_f1, 'std_f1': std_f1,
+        'avg_fpr': avg_fpr, 'std_fpr': std_fpr,
+        'avg_fnr': avg_fnr, 'std_fnr': std_fnr,
+    }
 
 
-# --- Main Execution ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='GNN for Link Prediction Training')
     parser.add_argument('--dataset', type=str, default='D1', choices=['D1', 'D2', 'D3'],
@@ -501,13 +491,10 @@ if __name__ == "__main__":
     print(f"Using device: {DEVICE}")
     print(f"Loading data for dataset: {args.dataset}")
 
-    # 1. Load all data once
     base_data = load_mixbroker_data(args.dataset)
     extra_train_data = load_and_prep_data_for_ranking(GROUND_TRUTH_FILES)
-    
-    base_data_np = np.array(base_data) # Convert to numpy array for easier indexing by KFold
+    base_data_np = np.array(base_data)
 
-    # 2. Define Ablation Study Configurations
     ablation_configs = []
     for use_graph in [True, False]:
         for use_extra in [True, False]:
@@ -519,18 +506,15 @@ if __name__ == "__main__":
                         'use_extra_data': use_extra
                     })
             else:
-                # If not using graph, GNN type doesn't matter.
                 ablation_configs.append({
                     'use_graph': use_graph,
                     'gnn_type': 'None',
                     'use_extra_data': use_extra
                 })
 
-    # 3. Run all experiments
     for config in ablation_configs:
         best_run_results = run_experiment(config, base_data_np, extra_train_data, DEVICE)
 
-        # --- Save Best Run Results to CSV ---
         if best_run_results:
             training_params = {
                 'Dataset': args.dataset,
@@ -541,7 +525,7 @@ if __name__ == "__main__":
                 'K_Fold': K_FOLD,
                 'Seed': SEED,
                 'Patience': EARLY_STOPPING_PATIENCE,
-                'Num_Runs': NUM_RUNS, # Hardcoded from inside run_experiment
+                'Num_Runs': NUM_RUNS,
                 'Pos_Weight': POS_WEIGHT,
                 'Use_Graph': config['use_graph'],
                 'GNN_Type': config['gnn_type'],

@@ -11,10 +11,6 @@ import time
 from Utils import *
 import json
 import numpy as np
-import torch
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
-from collections import defaultdict
 
 def GetAddressRelatedTransactions(type='tornado_cash', json_path='Dataset/tornado_neighbor_addresses.json'):
     if type == 'neighbor':
@@ -41,13 +37,11 @@ def GetAddressRelatedTransactions(type='tornado_cash', json_path='Dataset/tornad
     
     for address in tqdm(addresses, desc="Processing addresses"):
         for tt in ['Normal/', 'Internal/', 'ERC20/']:
-            # 检查该地址的交易文件是否已经存在
             file_path = f"{relatedTransactionPath}{tt}{address}.csv"
             if not (os.path.exists(file_path)):
-                # 如果文件不存在，则获取该地址的交易数据
                 try:
                     data.getTotalDatafromScan(address, tt, f"{relatedTransactionPath}{tt}",max_attempts=max_attempts)
-                    time.sleep(data.timeStep)  # 添加延时，避免API请求过于频繁
+                    time.sleep(data.timeStep)
                 except Exception as e:
                     print(f"Error processing {address} for {tt}: {e}")
 
@@ -65,5 +59,4 @@ def getNeighborAddressLabel():
         json.dump(tornado_neighbor_address_label, f)
 
 if __name__ == "__main__":
-    # getNeighborAddressLabel()
-    GetAddressRelatedTransactions(type='neighbor', json_path='Dataset/unique_addrs.json')
+    GetAddressRelatedTransactions(type='neighbor', json_path='Dataset/unique_addrs_train_val.json')
